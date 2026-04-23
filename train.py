@@ -1,14 +1,3 @@
-"""
-train.py — Main training entry point.
-
-This script IS the Webots robot controller.
-Set it as the controller of the E-puck Supervisor node in your .wbt world.
-
-Usage (Webots sets WEBOTS_ROBOT_NAME and calls this automatically):
-    # From the Webots controller selector, point to this file.
-    # Or launch manually for debugging (Webots must already be running):
-    python train.py --agent ppo --reward dense --timesteps 50000
-"""
 import argparse
 import csv
 import os
@@ -17,7 +6,6 @@ from typing import Optional
 
 import yaml
 
-# ── Graceful import check ──────────────────────────────────────────────────
 try:
     from controller import Supervisor  # noqa: F401  (just a presence check)
 except ModuleNotFoundError:
@@ -26,7 +14,7 @@ except ModuleNotFoundError:
         "  train.py must be run as a Webots robot controller, not from a plain "
         "Python interpreter.\n"
         "  Set this file as the controller in your .wbt world, or ensure "
-        "WEBOTS_HOME/lib/controller/python is on PYTHONPATH."
+        "WEBOTS_HOME/lib/controller/python3 is on PYTHONPATH."
     )
 
 from stable_baselines3 import PPO, DQN
@@ -36,8 +24,6 @@ from stable_baselines3.common.env_checker import check_env
 from env.gym_wrapper import WebotsLaneEnv
 from utils.metrics import summarise
 
-
-# ── Metrics callback ──────────────────────────────────────────────────────
 
 class MetricsCallback(BaseCallback):
     """
@@ -126,8 +112,6 @@ class MetricsCallback(BaseCallback):
                 ])
 
 
-# ── Checkpoint callback ──────────────────────────────────────────────────
-
 class CheckpointCallback(BaseCallback):
     """
     Periodically save the model while training.
@@ -165,28 +149,121 @@ class CheckpointCallback(BaseCallback):
         return True
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────
+def print_help() -> None:
+    """Print a friendly, detailed help message and exit."""
+    help_text = """
+╔══════════════════════════════════════════════════════════════════════════╗
+║                          train.py — Help                                 ║
+╠══════════════════════════════════════════════════════════════════════════╣
+║  Webots robot controller for lane-keeping RL training.                   ║
+║  Must be run as a Webots controller (not a plain Python interpreter).    ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+USAGE
+  python3 train.py [OPTIONS]
+
+OPTIONS
+  --agent   {ppo,dqn}              RL algorithm to use.
+                                   • ppo  → Proximal Policy Optimisation
+                                           (continuous action space)
+                                   • dqn  → Deep Q-Network
+                                           (discrete action space)
+                                   Default: ppo
+
+  --reward  {dense,ttc,sparse}     Reward shaping strategy.
+                                   • dense  → rich per-step reward signal
+                                   • ttc    → time-to-collision bonus
+                                   • sparse → reward only at episode end
+                                   Default: dense
+
+  --config  PATH                   Path to YAML config file.
+                                   Default: config.yaml
+
+  --timesteps INT                  Total training timesteps.
+                                   Overrides total_timesteps in config.yaml.
+
+  --resume  PATH                   Path to a saved .zip model to resume
+                                   training from (e.g. results/ppo_dense_model.zip).
+
+  --check-env                      Run the SB3 environment checker then exit.
+                                   Useful for validating your setup before a
+                                   full training run.
+
+  --help, -h                       Show this help message and exit.
+
+EXAMPLES
+  # Basic PPO training with dense rewards (uses config.yaml defaults)
+  python3 train.py
+
+  # DQN with sparse rewards for 100 000 timesteps
+  python3 train.py --agent dqn --reward sparse --timesteps 100000
+
+  # Resume a previous PPO run
+  python3 train.py --agent ppo --resume results/ppo_dense_model.zip
+
+  # Validate environment setup before training
+  python3 train.py --check-env
+
+  # Use a custom config file
+  python3 train.py --config configs/my_experiment.yaml --agent ppo
+
+OUTPUTS
+  results/<agent>_<reward>_model.zip            Final saved model.
+  results/<agent>_<reward>_metrics.csv          Per-episode metrics log (if enabled).
+  results/<agent>_<reward>_checkpoint_*.zip     Periodic checkpoints (if configured).
+
+NOTES
+  • config.yaml must exist at the path given by --config.
+  • train.py must be set as the Webots robot controller, or
+    WEBOTS_HOME/lib/controller/python must be on PYTHONPATH.
+  • Interrupt training at any time with Ctrl+C — the model will be saved.
+"""
+    print(help_text)
+    sys.exit(0)
+
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--agent",     choices=["ppo", "dqn"], default="ppo")
-    p.add_argument("--reward",    choices=["dense", "ttc", "sparse"], default="dense")
-    p.add_argument("--config",    default="config.yaml")
+    p = argparse.ArgumentParser(add_help=False)  # We handle --help ourselves
+    p.add_argument("--agent",     choices=["ppo", "dqn"], default=None)
+    p.add_argument("--reward",    choices=["dense", "ttc", "sparse"], default=None)
+    p.add_argument("--config",    default=None)
     p.add_argument("--timesteps", type=int, default=None,
                    help="Override total_timesteps from config")
-    p.add_argument("--resume", default=None, metavar="PATH",
+    p.add_argument("--resume",    default=None, metavar="PATH",
                    help="Path to a saved .zip model to continue training from")
     p.add_argument("--check-env", action="store_true",
                    help="Run SB3 env checker then exit (useful for first-run debugging)")
-    return p.parse_args()
+    p.add_argument("--help", "-h", action="store_true",
+                   help="Show this help message and exit")
 
+    args = p.parse_args()
 
-# ── Main ──────────────────────────────────────────────────────────────────
+    # Explicit --help / -h flag → always show help
+    if args.help:
+        print_help()
+
+    # No arguments at all → show help with a short nudge
+    if not sys.argv[1:]:
+        print(
+            "[train] No arguments provided — showing help.\n"
+            "  Pass your chosen options, or use --help for full details.\n"
+        )
+        print_help()
+
+    # Apply defaults for optional flags not supplied by the user
+    if args.agent is None:
+        args.agent = "ppo"
+    if args.reward is None:
+        args.reward = "dense"
+    if args.config is None:
+        args.config = "config.yaml"
+
+    return args
+
 
 def main():
     args = parse_args()
 
-    # ── Load config ───────────────────────────────────────────────
     config_path = args.config
     if not os.path.exists(config_path):
         sys.exit(
@@ -244,7 +321,6 @@ def main():
     else:
         model = AgentCls(**agent_kwargs)
 
-    # ── Metrics callback ──────────────────────────────────────────
     mon_cfg       = cfg.get("monitoring", {}) or {}
     summary_every = int(mon_cfg.get("summary_every_n_episodes", 10))
     csv_log       = bool(mon_cfg.get("csv_log", True))
@@ -257,7 +333,6 @@ def main():
         csv_path      = csv_path,
     )
 
-    # ── Checkpoint callback ───────────────────────────────────────
     callbacks = [metrics_cb]
     ckpt_every = int(cfg.get("training", {}).get("checkpoint_every_n_steps", 0))
     if ckpt_every > 0:
@@ -270,7 +345,6 @@ def main():
             )
         )
 
-    # ── Train ─────────────────────────────────────────────────────
     save_path = f"results/{args.agent}_{args.reward}_model"
     print(f"[train] Starting training for {timesteps} timesteps …")
     print(f"[train] Model will be saved to '{save_path}.zip'")
