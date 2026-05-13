@@ -29,9 +29,8 @@ class WebotsLaneEnv(gym.Env):
         self.config      = config
         self.render_mode = render_mode
 
-        self._collision_threshold = config["reward"].get("collision_threshold", 0.3)
-        self._reward_cfg          = config["reward"]
-        self._action_type         = config["action_space"]["type"]
+        self._reward_cfg  = config["reward"]
+        self._action_type = config["action_space"]["type"]
 
         # Monitoring thresholds (optional section in config.yaml).
         mon_cfg                   = config.get("monitoring", {}) or {}
@@ -40,10 +39,10 @@ class WebotsLaneEnv(gym.Env):
         lap_return                = float(mon_cfg.get("lap_return_distance", 5.0))
 
         # Truncation thresholds (optional section in config.yaml).
-        ep_cfg                        = config.get("episode", {}) or {}
-        self._max_steps               = int(ep_cfg.get("max_steps", 2000))
-        self._stall_speed_threshold   = float(ep_cfg.get("stall_speed_threshold", 0.1))
-        self._stall_steps             = int(ep_cfg.get("stall_steps", 100))
+        ep_cfg                      = config.get("episode", {}) or {}
+        self._max_steps             = int(ep_cfg.get("max_steps", 2000))
+        self._stall_speed_threshold = float(ep_cfg.get("stall_speed_threshold", 0.1))
+        self._stall_steps           = int(ep_cfg.get("stall_steps", 100))
 
         # Per-episode step / stall counters (reset each reset()).
         self._step_count: int    = 0
@@ -51,10 +50,10 @@ class WebotsLaneEnv(gym.Env):
 
         # Hardware driver — the only place Webots is touched
         self._hw = WebotsEnv(
-            near_miss_threshold     = self._near_miss_threshold,
-            collision_threshold     = self._collision_threshold,
-            lap_departure_distance  = lap_departure,
-            lap_return_distance     = lap_return,
+            near_miss_threshold    = self._near_miss_threshold,
+            collision_threshold    = float(config["reward"].get("collision_threshold", 0.3)),
+            lap_departure_distance = lap_departure,
+            lap_return_distance    = lap_return,
         )
 
         # ── Observation space ─────────────────────────────────────
@@ -73,7 +72,7 @@ class WebotsLaneEnv(gym.Env):
             # 0=left  1=right  2=straight  3=brake
             self.action_space = spaces.Discrete(4)
 
-        self._current_stats: Optional[EpisodeStats] = None
+        self._current_stats: Optional[EpisodeStats]  = None
         self._completed_episodes: List[EpisodeStats] = []
         self._episode_start_time: float              = 0.0
 
@@ -96,24 +95,21 @@ class WebotsLaneEnv(gym.Env):
 
         self._hw.step()
 
-        # 3. Raw sensor read — used by reward, collision and stats because
-        #    those expect physical units (m/s, metres). The agent will
-        #    instead receive the normalised version returned below.
+        # Raw sensor read — used by reward and stats (physical units).
         raw_obs = self._get_raw_obs()
 
-        # 4. Step / stall bookkeeping (raw speed in m/s from state[0]).
+        # Step / stall bookkeeping.
         self._step_count += 1
         if float(raw_obs["state"][0]) < self._stall_speed_threshold:
             self._stall_counter += 1
         else:
             self._stall_counter = 0
 
-        # 5. Termination check (raw lidar in metres) — collision only
-        terminated = self._is_collision(raw_obs["lidar"])
+        # Termination check — physics-based touch sensor, no LiDAR threshold.
+        terminated = self._is_collision()
         truncated  = False
 
-        # 6. Truncation checks (AFTER collision, BEFORE reward). Collision
-        #    wins; otherwise max_steps or stalled may truncate the episode.
+        # Truncation checks (after collision, before reward).
         if terminated:
             termination_reason = "collision"
         elif self._max_steps > 0 and self._step_count >= self._max_steps:
@@ -125,13 +121,8 @@ class WebotsLaneEnv(gym.Env):
         else:
             termination_reason = ""
 
-        # 7. Reward (raw speed in m/s, raw lidar in metres)
         reward = self._compute_reward(raw_obs, terminated)
-
-        # 8. Episode stats (raw values)
         self._update_episode_stats(raw_obs, terminated, truncated, reward)
-
-        # 9. Normalised observation for the agent
         obs = preprocess_obs(raw_obs, self.config)
 
         return obs, reward, terminated, truncated, {"termination_reason": termination_reason}
@@ -166,8 +157,9 @@ class WebotsLaneEnv(gym.Env):
         """Normalised observation for the agent (matches observation_space)."""
         return preprocess_obs(self._get_raw_obs(), self.config)
 
-    def _is_collision(self, lidar: np.ndarray) -> bool:
-        return bool(lidar.min() < self._collision_threshold)
+    def _is_collision(self) -> bool:
+        """Physics-based collision detection via touch sensor."""
+        return self._hw.is_collision()
 
     def _compute_reward(self, obs: dict, terminated: bool) -> float:
         v     = float(obs["state"][0])   # speed
@@ -175,8 +167,8 @@ class WebotsLaneEnv(gym.Env):
         # TODO: `d` is a proxy for the lateral distance to the yellow line —
         # it is the normalised image offset |theta| ∈ [0, 1], NOT a metric
         # cross-track error.
-        d     = abs(theta)
-        cfg   = self._reward_cfg
+        d   = abs(theta)
+        cfg = self._reward_cfg
 
         reward_type = cfg.get("type", "dense")
 
@@ -199,26 +191,19 @@ class WebotsLaneEnv(gym.Env):
         if stats is None:
             return
 
-        # Step / reward accumulation.
-        stats.total_steps += 1
+        stats.total_steps  += 1
         stats.total_reward += float(reward)
-
         stats.cross_track_errors.append(abs(float(obs["state"][1])))
-
-        # Distance travelled is cumulative in the HW driver — overwrite.
         stats.distance_travelled = self._hw.get_distance_travelled()
 
-        # Near-miss: counted once per step that registers one.
         if self._hw.is_near_miss():
             stats.near_misses += 1
 
-        # Lap completed this step → record its duration.
         if self._hw.get_lap_completed():
             last_lap = self._hw.get_last_lap_time()
             if last_lap is not None:
                 stats.lap_times.append(float(last_lap))
 
-        # Collision is terminal — count it exactly once on the terminating step.
         if terminated:
             stats.collisions += 1
 

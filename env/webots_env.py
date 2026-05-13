@@ -14,13 +14,12 @@ LIDAR_OUT_SIZE = 512
 YELLOW_LO = np.array([18,  80,  80], dtype=np.uint8)
 YELLOW_HI = np.array([35, 255, 255], dtype=np.uint8)
 
-WHEEL_RADIUS = 0.35
 
 class WebotsEnv:
     """
     Thin wrapper around the City demo car's Webots devices.
 
-      - Enable and read sensors (camera, LiDAR)
+      - Enable and read sensors (camera, LiDAR, touch)
       - Write steering and throttle commands (Ackermann drive)
       - Reset simulation state via Supervisor
       - Expose raw physical quantities (speed, alignment angle)
@@ -43,8 +42,8 @@ class WebotsEnv:
             (but not a collision). A near-miss is a min-lidar reading in
             (collision_threshold, near_miss_threshold].
         collision_threshold : float
-            LiDAR distance (m) below which a step is treated as a
-            collision; used here only to separate near-miss from crash.
+            LiDAR distance (m) used only to separate near-miss from crash
+            in _update_tracking. Collision detection itself uses the touch sensor.
         lap_departure_distance : float
             Metres the car must travel away from its spawn before the
             lap-completion detector becomes armed.
@@ -64,14 +63,13 @@ class WebotsEnv:
         # ── LiDAR ─────────────────────────────────────────────────
         self.lidar = self.driver.getDevice("lidar")
         self.lidar.enable(TIME_STEP)
-        # Use horizontal resolution for a flat 1-D range scan (no point cloud needed)
         self.lidar_size = LIDAR_OUT_SIZE
 
         # ── Steering motors ───────────────────────────────────────
         self.left_steer  = self.driver.getDevice("left_steer")
         self.right_steer = self.driver.getDevice("right_steer")
         for s in (self.left_steer, self.right_steer):
-            s.setPosition(0.0)   # position-control mode, start straight
+            s.setPosition(0.0)
 
         self.left_wheel  = self.driver.getDevice("left_front_wheel")
         self.right_wheel = self.driver.getDevice("right_front_wheel")
@@ -81,17 +79,12 @@ class WebotsEnv:
 
         # ── Supervisor: needed for teleport-reset ─────────────────
         self.driver_node = self.driver.getSelf()
-        print(self.driver_node)
         self._init_translation = list(
             self.driver_node.getField("translation").getSFVec3f()
         )
         self._init_rotation = list(
             self.driver_node.getField("rotation").getSFRotation()
         )
-        print(f"[init] translation={self._init_translation}")
-        print(f"[init] rotation={self._init_rotation}")
-        print(f"[init] node type={self.driver_node.getType()}")
-        print(f"[init] node def={self.driver_node.getDef()}")
 
         # ── Episode tracking config ───────────────────────────────
         self._near_miss_threshold       = float(near_miss_threshold)
@@ -133,12 +126,18 @@ class WebotsEnv:
             self._reset_tracking()
             return
 
-        print(f"[reset] teleporting back to {self._init_translation}")
-
         self.driver.setCruisingSpeed(0.0)
         self.driver.setSteeringAngle(0.0)
 
-        self.driver.worldReload()
+        trans_field = self.driver_node.getField("translation")
+        rot_field   = self.driver_node.getField("rotation")
+        trans_field.setSFVec3f(self._init_translation)
+        rot_field.setSFRotation(self._init_rotation)
+        self.driver_node.resetPhysics()
+
+        for _ in range(5):
+            self.driver.step()
+
         self._reset_tracking()
 
     # ── Episode tracking ──────────────────────────────────────────
@@ -156,7 +155,7 @@ class WebotsEnv:
 
     def _update_tracking(self):
         """Update distance, lap state and near-miss flag for the most recent step."""
-        now = float(self.driver.getTime())
+        now     = float(self.driver.getTime())
         current = self.driver_node.getField("translation").getSFVec3f()
 
         # Path-length integration for total distance travelled.
@@ -169,9 +168,9 @@ class WebotsEnv:
         # Lap detection: arm after the car is far enough from spawn, then
         # fire exactly once when the car returns close to spawn.
         init = self._init_translation
-        dxi = current[0] - init[0]
-        dyi = current[1] - init[1]
-        dzi = current[2] - init[2]
+        dxi  = current[0] - init[0]
+        dyi  = current[1] - init[1]
+        dzi  = current[2] - init[2]
         dist_from_init = float(np.sqrt(dxi * dxi + dyi * dyi + dzi * dzi))
 
         self._lap_just_completed_flag = False
@@ -192,7 +191,7 @@ class WebotsEnv:
             self._collision_threshold < d_min <= self._near_miss_threshold
         )
 
-    # ── Episode tracking accessors ───────────────────────────────
+    # ── Episode tracking accessors ────────────────────────────────
 
     def get_lap_completed(self) -> bool:
         """True iff a full lap was completed in the most recent step."""
@@ -223,47 +222,39 @@ class WebotsEnv:
         """(H, W, 3) uint8 RGB array."""
         raw = self.camera.getImage()
         img = np.frombuffer(raw, dtype=np.uint8).reshape((self.cam_h, self.cam_w, 4))
-        return img[:, :, :3].copy()   # drop alpha channel
+        return img[:, :, :3].copy()
 
     def get_lidar_scan(self) -> np.ndarray:
         scan = np.array(self.lidar.getRangeImage(), dtype=np.float32)
         scan = np.clip(np.nan_to_num(scan, nan=10.0, posinf=10.0), 0.0, 10.0)
-        scan[scan < 0.25] = 10.0  # filter car's own body
+        scan[scan < 0.32] = 10.0  # body noise peaks at 0.265, filter up to 0.32
         indices = np.linspace(0, len(scan) - 1, LIDAR_OUT_SIZE, dtype=int)
         return scan[indices]
+
+    def is_collision(self) -> bool:
+        """Returns list of contact points on this node."""
+        contacts = self.driver_node.getContactPoints()
+        return len(contacts) > 0
 
     def get_forward_speed(self) -> float:
         """
         Signed speed along the car's forward axis (m/s).
-        Positive → moving forward.
-        Negative → moving backward.
+        Positive → moving forward, negative → moving backward.
         """
-        v = self.driver_node.getVelocity()[:3]          # world-frame [vx, vy, vz]
-        
-        # Rotation matrix: columns are the car's local X, Y, Z axes in world frame
-        # Row 2 (index 2) is the local forward axis (−Z in Webots convention)
-        rot = np.array(self.driver_node.getOrientation()).reshape(3, 3)
-        forward_axis = rot[:, 2]                        # local +Z column
-        
-        return float(np.dot(v, -forward_axis))          # negate: Webots +Z is backward
-
-    def get_speed(self) -> float:
-        """Scalar translational speed in m/s."""
-        v = self.driver_node.getVelocity()   # [vx, vy, vz, wx, wy, wz]
-        return float(np.linalg.norm(v[:3]))
+        v            = self.driver_node.getVelocity()[:3]
+        rot          = np.array(self.driver_node.getOrientation()).reshape(3, 3)
+        forward_axis = rot[:, 2]
+        return float(np.dot(v, -forward_axis))
 
     def get_alignment_angle(self) -> float:
         """
         Normalised lateral offset of the yellow centre line ∈ [-1, 1].
-        Negative  → line is to the left of centre.
-        Returns 0.0 when the line is not visible.
+        Negative → line is to the left of centre.
+        Returns 1.0 when the line is not visible.
 
-        NOTE: This is an image-plane *proxy* for the cross-track error used
-        in evaluation metrics — it is a unitless fraction of half-image
-        width, NOT a lateral distance in metres. A proper CTE would require
-        knowing the world-frame road geometry.
+        NOTE: This is an image-plane proxy for cross-track error —
+        a unitless fraction of half-image width, NOT metres.
         """
-
         img  = self.get_camera_image()
         hsv  = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
         mask = cv2.inRange(hsv, YELLOW_LO, YELLOW_HI)
@@ -274,7 +265,6 @@ class WebotsEnv:
 
         cx     = float(cols.mean())
         centre = self.cam_w / 2.0
-
         return (cx - centre) / centre
 
     def get_min_lidar_distance(self) -> float:
@@ -282,27 +272,20 @@ class WebotsEnv:
 
     def set_controls(self, steering: float, throttle: float):
         angle = float(np.clip(steering, -1.0, 1.0)) * MAX_STEER
-        speed = float(np.clip(throttle, -1.0, 1.0)) * MAX_SPEED  # km/h, correct for Driver
-
+        speed = float(np.clip(throttle, -1.0, 1.0)) * MAX_SPEED
         self.driver.setSteeringAngle(angle)
         self.driver.setCruisingSpeed(speed)
 
     def apply_continuous(self, steering: float, throttle: float):
-        """
-        steering ∈ [-1, 1]  (negative = turn left)
-        throttle ∈ [-1, 1]  (positive = forward)
-        """
+        """steering ∈ [-1, 1] (negative = left), throttle ∈ [-1, 1] (positive = forward)."""
         self.set_controls(steering, throttle)
 
     def apply_discrete(self, action: int):
-        """
-        0 = left   | 1 = right
-        2 = straight | 3 = brake
-        """
+        """0 = left | 1 = right | 2 = straight | 3 = brake."""
         cmds = {
-            0: (-1.0,  0.5),   # steer left,  half throttle
-            1: ( 1.0,  0.5),   # steer right, half throttle
-            2: ( 0.0,  1.0),   # straight,    full throttle
-            3: ( 0.0,  0.0),   # brake
+            0: (-1.0,  0.5),
+            1: ( 1.0,  0.5),
+            2: ( 0.0,  1.0),
+            3: ( 0.0,  0.0),
         }
         self.set_controls(*cmds[int(action)])

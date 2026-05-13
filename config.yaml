@@ -28,7 +28,7 @@ reward:
   w4: 10.0                          # terminal penalty weight
   d_safe: 1.0                       # safety radius (metres)
   # collision detection threshold
-  collision_threshold: 0.15         # metres — LiDAR below this → terminated
+  collision_threshold: 0.35          # metres — LiDAR below this → terminated
 
 agent:
   learning_rate: 3.0e-4
