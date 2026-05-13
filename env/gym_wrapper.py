@@ -48,12 +48,18 @@ class WebotsLaneEnv(gym.Env):
         self._step_count: int    = 0
         self._stall_counter: int = 0
 
+        # Obstacle config: optional `obstacles` section in config.yaml.
+        # When omitted or {"enabled": False}, the obstacle subsystem is
+        # fully inert and behaviour matches the pre-obstacle baseline.
+        obstacles_cfg = config.get("obstacles", {}) or {}
+
         # Hardware driver — the only place Webots is touched
         self._hw = WebotsEnv(
             near_miss_threshold    = self._near_miss_threshold,
             collision_threshold    = float(config["reward"].get("collision_threshold", 0.3)),
             lap_departure_distance = lap_departure,
             lap_return_distance    = lap_return,
+            obstacles_cfg          = obstacles_cfg,
         )
 
         # ── Observation space ─────────────────────────────────────
@@ -78,6 +84,9 @@ class WebotsLaneEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        # Remove any dynamically spawned barrels (node.remove()) BEFORE
+        # the teleport-based reset, then clear Python-side bookkeeping.
+        self._hw.clear_obstacles()
         self._hw.reset()
 
         self._current_stats      = EpisodeStats()
@@ -94,6 +103,10 @@ class WebotsLaneEnv(gym.Env):
             self._hw.apply_discrete(int(action))
 
         self._hw.step()
+        # Recycle barrels behind the car and conditionally spawn a new one
+        # ahead. No-op when obstacles are disabled, so this is safe to call
+        # every step regardless of mode.
+        self._hw.update_obstacles()
 
         # Raw sensor read — used by reward and stats (physical units).
         raw_obs = self._get_raw_obs()

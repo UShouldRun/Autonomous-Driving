@@ -57,6 +57,8 @@ def parse_args():
                    help="Do NOT terminate episodes on lap completion")
     p.add_argument("--stochastic", action="store_true",
                    help="Use deterministic=False in model.predict()")
+    p.add_argument("--obstacles", action="store_true",
+                   help="Enable dynamic barrel obstacle spawning (see config.yaml: obstacles)")
     return p.parse_args()
 
 
@@ -104,11 +106,19 @@ def main():
     else:
         cfg["action_space"]["type"] = "continuous"
 
+    # --obstacles flips the obstacle subsystem on (defaults to off in
+    # config.yaml so backward compatibility is preserved when the flag
+    # isn't passed). All other obstacle parameters are read from config.
+    if args.obstacles:
+        cfg.setdefault("obstacles", {})["enabled"] = True
+
     # ── Build environment and bind to the model ──────────────────
-    reward_type = cfg.get("reward", {}).get("type", "dense")
+    reward_type  = cfg.get("reward", {}).get("type", "dense")
+    obstacles_on = bool(cfg.get("obstacles", {}).get("enabled", False))
     print(f"[eval] Building environment  "
           f"action_space={cfg['action_space']['type']}  "
-          f"reward={reward_type}")
+          f"reward={reward_type}  "
+          f"obstacles={'on' if obstacles_on else 'off'}")
     env = WebotsLaneEnv(cfg)
     model.set_env(env)
 

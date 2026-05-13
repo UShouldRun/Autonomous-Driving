@@ -189,6 +189,14 @@ OPTIONS
                                    Useful for validating your setup before a
                                    full training run.
 
+  --obstacles                      Enable dynamic barrel-obstacle spawning.
+                                   Barrels appear ahead of the car at random
+                                   intervals (configured under the
+                                   `obstacles` section of config.yaml) and
+                                   are recycled once the car drives past
+                                   them. Disabled by default — behaviour is
+                                   then identical to the pre-obstacle code.
+
   --help, -h                       Show this help message and exit.
 
 EXAMPLES
@@ -203,6 +211,9 @@ EXAMPLES
 
   # Validate environment setup before training
   python3 train.py --check-env
+
+  # Train with dynamic barrel obstacles spawning ahead of the car
+  python3 train.py --agent ppo --obstacles --timesteps 500
 
   # Use a custom config file
   python3 train.py --config configs/my_experiment.yaml --agent ppo
@@ -233,6 +244,8 @@ def parse_args():
                    help="Path to a saved .zip model to continue training from")
     p.add_argument("--check-env", action="store_true",
                    help="Run SB3 env checker then exit (useful for first-run debugging)")
+    p.add_argument("--obstacles", action="store_true",
+                   help="Enable dynamic barrel obstacle spawning (see config.yaml: obstacles)")
     p.add_argument("--help", "-h", action="store_true",
                    help="Show this help message and exit")
 
@@ -277,12 +290,21 @@ def main():
     # CLI flags override config values
     cfg["reward"]["type"]       = args.reward
     cfg["action_space"]["type"] = "continuous" if args.agent == "ppo" else "discrete"
+    # --obstacles flips the obstacle subsystem on (defaults to off in
+    # config.yaml so backward compatibility is preserved when the flag
+    # isn't passed). All other obstacle parameters are read from config.
+    if args.obstacles:
+        cfg.setdefault("obstacles", {})["enabled"] = True
 
     # ── Output directory ──────────────────────────────────────────
     os.makedirs("results", exist_ok=True)
 
     # ── Build environment ─────────────────────────────────────────
-    print(f"[train] Building environment  agent={args.agent}  reward={args.reward}")
+    obstacles_on = bool(cfg.get("obstacles", {}).get("enabled", False))
+    print(
+        f"[train] Building environment  agent={args.agent}  "
+        f"reward={args.reward}  obstacles={'on' if obstacles_on else 'off'}"
+    )
     env = WebotsLaneEnv(cfg)
 
     # Optional: validate the env against the Gym API before training

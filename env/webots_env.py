@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import cv2
@@ -14,6 +14,11 @@ LIDAR_OUT_SIZE = 512
 YELLOW_LO = np.array([18,  80,  80], dtype=np.uint8)
 YELLOW_HI = np.array([35, 255, 255], dtype=np.uint8)
 
+
+# DEF-name prefix for dynamically-spawned barrel obstacles. Each barrel gets
+# a unique suffix so we can recover its Node handle via getFromDef after
+# importMFNodeFromString (which returns only a success flag, not the node).
+BARREL_DEF_PREFIX = "BARREL_DYN"
 
 class WebotsEnv:
     """
@@ -33,6 +38,7 @@ class WebotsEnv:
         collision_threshold: float = 0.3,
         lap_departure_distance: float = 20.0,
         lap_return_distance: float = 5.0,
+        obstacles_cfg: Optional[Dict[str, Any]] = None,
     ):
         """
         Parameters
@@ -50,6 +56,11 @@ class WebotsEnv:
         lap_return_distance : float
             Metres within which, after having departed, a return to the
             spawn counts as completing one lap.
+        obstacles_cfg : dict, optional
+            Configuration for the dynamic barrel-obstacle subsystem.
+            When None or ``{"enabled": False}`` (the default), the obstacle
+            system is fully inert: no nodes are imported, no per-step work
+            is done, and behaviour is identical to the pre-obstacle code.
         """
         self.driver = Driver()
         self._first_reset = True
@@ -102,6 +113,16 @@ class WebotsEnv:
         self._lap_just_completed_flag: bool = False
         self._near_miss_flag: bool          = False
 
+        # ── Obstacle subsystem ────────────────────────────────────
+        # Stored as a plain dict; all reads guard on _obstacles_enabled
+        # so a None/disabled config makes every obstacle method a no-op.
+        self._obstacles_cfg: Dict[str, Any]   = dict(obstacles_cfg or {})
+        self._obstacles_enabled: bool         = bool(self._obstacles_cfg.get("enabled", False))
+        # Tracked across the episode; cleared by clear_obstacles().
+        self._obstacle_nodes: List[Dict[str, Any]] = []
+        self._next_spawn_distance: float      = 0.0
+        self._obstacle_counter: int           = 0
+
         self.driver.step()          # must come first
         self.driver.setGear(1)      # now the transmission is ready
         self.driver.setCruisingSpeed(0.0)
@@ -124,11 +145,14 @@ class WebotsEnv:
         if self._first_reset:
             self._first_reset = False
             self._reset_tracking()
+            self._reset_obstacle_state()
             return
 
         self.driver.setCruisingSpeed(0.0)
         self.driver.setSteeringAngle(0.0)
 
+        # Teleport-based reset (faster than worldReload). clear_obstacles()
+        # already removed any dynamically spawned barrels via node.remove().
         trans_field = self.driver_node.getField("translation")
         rot_field   = self.driver_node.getField("rotation")
         trans_field.setSFVec3f(self._init_translation)
@@ -139,6 +163,7 @@ class WebotsEnv:
             self.driver.step()
 
         self._reset_tracking()
+        self._reset_obstacle_state()
 
     # ── Episode tracking ──────────────────────────────────────────
 
@@ -215,6 +240,211 @@ class WebotsEnv:
     def is_near_miss(self) -> bool:
         """True iff the most recent step registered a near-miss."""
         return self._near_miss_flag
+
+    # ── Obstacle subsystem ────────────────────────────────────────
+
+    @property
+    def obstacles_enabled(self) -> bool:
+        return self._obstacles_enabled
+
+    def update_obstacles(self) -> None:
+        """Per-step driver of the obstacle subsystem.
+
+        Recycles barrels the car has already driven past, then conditionally
+        spawns a new barrel ahead of the car. Safe to call every step; a
+        no-op when obstacles are disabled.
+        """
+        if not self._obstacles_enabled:
+            return
+        self._recycle_passed_obstacles()
+        self._maybe_spawn_obstacle()
+
+    def clear_obstacles(self) -> None:
+        """Drop every tracked barrel and reset spawn scheduling state.
+
+        Called on reset(). Uses node.remove() defensively for any handles
+        that survive (they should not, post-worldReload, but the operation
+        is cheap and tolerant of an already-removed node).
+        """
+        for entry in self._obstacle_nodes:
+            node = entry.get("node")
+            if node is None:
+                continue
+            try:
+                node.remove()
+            except Exception:
+                # Already gone (e.g., after worldReload) — nothing to do.
+                pass
+        self._reset_obstacle_state()
+
+    def _reset_obstacle_state(self) -> None:
+        """Clear the Python-side obstacle bookkeeping without touching nodes."""
+        self._obstacle_nodes = []
+        # Schedule the first spawn after the car has driven at least one
+        # full spawn interval — prevents a barrel appearing immediately
+        # on top of a stationary car at the start of an episode.
+        interval_min = float(self._obstacles_cfg.get("spawn_interval_min_m", 30.0))
+        interval_max = float(self._obstacles_cfg.get("spawn_interval_max_m", 70.0))
+        if interval_max < interval_min:
+            interval_max = interval_min
+        self._next_spawn_distance = float(np.random.uniform(interval_min, interval_max))
+        self._obstacle_counter = 0
+
+    def _maybe_spawn_obstacle(self) -> None:
+        """Spawn one barrel ahead of the car if cadence + cap conditions allow."""
+        if len(self._obstacle_nodes) >= int(self._obstacles_cfg.get("max_active", 3)):
+            return
+        if self._distance_travelled < self._next_spawn_distance:
+            return
+
+        spawned = self._spawn_obstacle_ahead()
+        if not spawned:
+            # Don't reschedule on failure — try again on the next step.
+            return
+
+        interval_min = float(self._obstacles_cfg.get("spawn_interval_min_m", 30.0))
+        interval_max = float(self._obstacles_cfg.get("spawn_interval_max_m", 70.0))
+        if interval_max < interval_min:
+            interval_max = interval_min
+        self._next_spawn_distance = self._distance_travelled + float(
+            np.random.uniform(interval_min, interval_max)
+        )
+
+    def _spawn_obstacle_ahead(self) -> bool:
+        """Import a new barrel into the scene tree ahead of the car.
+
+        Returns True on success. The position is sampled uniformly within
+        the configured ahead/lateral ranges and snapped to ground via the
+        ``barrel_y`` config value.
+        """
+        car_pos = np.array(
+            self.driver_node.getField("translation").getSFVec3f(),
+            dtype=np.float64,
+        )
+        rot = np.array(self.driver_node.getOrientation()).reshape(3, 3)
+        # See get_forward_speed(): local +Z is the car's backward axis, so
+        # the world-frame forward unit vector is -rot[:, 2]. The right
+        # vector is the local +X column.
+        forward_world = -rot[:, 2]
+        right_world   = rot[:, 0]
+
+        d_min = float(self._obstacles_cfg.get("distance_ahead_min", 15.0))
+        d_max = float(self._obstacles_cfg.get("distance_ahead_max", 35.0))
+        if d_max < d_min:
+            d_max = d_min
+        distance_ahead = float(np.random.uniform(d_min, d_max))
+        # Hard safety floor — never spawn closer than min_spawn_distance,
+        # even if the configured range allowed it.
+        distance_ahead = max(
+            distance_ahead,
+            float(self._obstacles_cfg.get("min_spawn_distance", 10.0)),
+        )
+
+        lat_max = float(self._obstacles_cfg.get("lateral_offset_max", 4.0))
+        lateral_offset = float(np.random.uniform(-lat_max, lat_max))
+
+        spawn_pos = car_pos + distance_ahead * forward_world + lateral_offset * right_world
+        # Override the vertical component (Z in this ENU / Z-up world) so
+        # the barrel centre sits at half-height above the ground plane
+        # rather than tracking whatever Z the car happens to be at.
+        spawn_pos[2] = float(self._obstacles_cfg.get("barrel_z", 0.5))
+
+        self._obstacle_counter += 1
+        def_name = f"{BARREL_DEF_PREFIX}_{self._obstacle_counter}"
+        vrml = self._barrel_vrml(def_name, spawn_pos)
+
+        try:
+            root_children = self.driver.getRoot().getField("children")
+            root_children.importMFNodeFromString(-1, vrml)
+        except Exception as exc:
+            print(f"[obstacles] importMFNodeFromString failed: {exc}")
+            return False
+
+        node = self.driver.getFromDef(def_name)
+        if node is None:
+            print(f"[obstacles] getFromDef('{def_name}') returned None")
+            return False
+
+        self._obstacle_nodes.append({
+            "node":     node,
+            "def_name": def_name,
+            "spawn_pos": spawn_pos.tolist(),
+        })
+        return True
+
+    def _barrel_vrml(self, def_name: str, pos: np.ndarray) -> str:
+        """Build the VRML string for one barrel Solid.
+
+        The Solid has both a visible Shape (so the user can see it in the
+        3D view and the camera sensor picks it up) and a boundingObject
+        (so LiDAR ranges and collisions hit it). No Physics node is
+        attached — barrels are static obstacles, not rigid bodies.
+        """
+        radius = float(self._obstacles_cfg.get("barrel_radius", 0.4))
+        height = float(self._obstacles_cfg.get("barrel_height", 1.0))
+        color  = self._obstacles_cfg.get("barrel_color", [1.0, 0.4, 0.0])
+        r, g, b = (float(color[0]), float(color[1]), float(color[2]))
+        # The world uses ENU coordinates (Z-up). The Cylinder geometry's
+        # default axis is local Y, which would make the barrel lie flat.
+        # A 90° rotation around X stands it upright (local Y → world Z).
+        return (
+            f"DEF {def_name} Solid {{ "
+            f"translation {pos[0]:.4f} {pos[1]:.4f} {pos[2]:.4f} "
+            f"rotation 1 0 0 1.5708 "
+            f'name "{def_name.lower()}" '
+            f"children [ "
+            f"Shape {{ "
+            f"appearance PBRAppearance {{ "
+            f"baseColor {r:.3f} {g:.3f} {b:.3f} "
+            f"roughness 0.6 metalness 0 "
+            f"}} "
+            f"geometry Cylinder {{ height {height} radius {radius} }} "
+            f"}} "
+            f"] "
+            f"boundingObject Cylinder {{ height {height} radius {radius} }} "
+            f"}}"
+        )
+
+    def _recycle_passed_obstacles(self) -> None:
+        """Remove every barrel that is far enough behind the car.
+
+        A barrel is considered behind the car when the dot product of
+        (barrel - car) with the forward unit vector is less than
+        ``-recycle_behind_distance``. Using a signed projection (rather
+        than raw Euclidean distance) means a barrel directly to one side
+        is not recycled.
+        """
+        if not self._obstacle_nodes:
+            return
+
+        car_pos = np.array(
+            self.driver_node.getField("translation").getSFVec3f(),
+            dtype=np.float64,
+        )
+        rot = np.array(self.driver_node.getOrientation()).reshape(3, 3)
+        forward_world = -rot[:, 2]
+        recycle_behind = float(self._obstacles_cfg.get("recycle_behind_distance", 3.0))
+
+        remaining: List[Dict[str, Any]] = []
+        for entry in self._obstacle_nodes:
+            node = entry["node"]
+            try:
+                barrel_pos = np.array(
+                    node.getField("translation").getSFVec3f(),
+                    dtype=np.float64,
+                )
+            except Exception:
+                # Node was somehow already removed — drop it from tracking.
+                continue
+            forward_distance = float(np.dot(barrel_pos - car_pos, forward_world))
+            if forward_distance < -recycle_behind:
+                try:
+                    node.remove()
+                except Exception as exc:
+                    print(f"[obstacles] node.remove() failed for {entry['def_name']}: {exc}")
+            else:
+                remaining.append(entry)
+        self._obstacle_nodes = remaining
 
     # ── Sensor reads ──────────────────────────────────────────────
 

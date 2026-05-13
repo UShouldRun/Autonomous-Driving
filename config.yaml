@@ -58,3 +58,38 @@ monitoring:
   summary_every_n_episodes: 10
   # Write training metrics to a CSV file in results/.
   csv_log: true
+
+obstacles:
+  # Master switch. When false the obstacle subsystem is fully inert — no
+  # nodes are spawned, no per-step work is done. Enable via --obstacles in
+  # train.py / evaluate.py (which sets this to true at runtime).
+  enabled: false
+  # Spawn cadence is measured in car-travel distance rather than wallclock
+  # or sim steps, so behaviour is independent of vehicle speed and time-step.
+  spawn_interval_min_m: 30.0      # metres of progress before a new spawn is allowed (min)
+  spawn_interval_max_m: 70.0      # metres of progress before a new spawn is allowed (max)
+  # Where (relative to the car) to place a freshly-spawned barrel.
+  distance_ahead_min: 15.0        # metres ahead of the car (min)
+  distance_ahead_max: 35.0        # metres ahead of the car (max)
+  # Hard safety floor — the spawn distance is clipped up to at least this
+  # value so a barrel can never appear right in front of the car.
+  min_spawn_distance: 10.0        # metres
+  # Lateral spread, perpendicular to the car's forward axis, sampled
+  # uniformly in [-lateral_offset_max, +lateral_offset_max]. The road half
+  # the car drives on is ~10.75m wide, so ±4m keeps barrels in-lane.
+  lateral_offset_max: 4.0         # metres
+  # Cap on simultaneous barrels in the scene at any one time.
+  max_active: 3
+  # Distance (m) the car must be past a barrel before it is recycled
+  # (removed from the scene). Slight buffer so a barrel doesn't vanish the
+  # instant the bumper passes it.
+  recycle_behind_distance: 3.0    # metres
+  # Physical dimensions of the barrel (visual + boundingObject).
+  barrel_radius: 0.4              # metres
+  barrel_height: 1.0              # metres
+  # Z-coordinate of the barrel centre (this world uses ENU / Z-up). With
+  # height=1.0 and Z=0.5 the cylinder sits flush on the Z=0 ground plane.
+  barrel_z: 0.5
+  # RGB baseColor for the barrel's PBRAppearance. Orange is the canonical
+  # traffic-cone hue and contrasts strongly against the road surface.
+  barrel_color: [1.0, 0.4, 0.0]
