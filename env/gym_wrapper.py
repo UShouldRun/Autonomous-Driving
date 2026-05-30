@@ -7,7 +7,7 @@ import cv2
 from gymnasium import spaces
 
 from env.webots_env import WebotsEnv
-from env.reward import dense_reward, ttc_reward, sparse_reward
+from env.reward import dense_reward, ttc_reward, sparse_reward, dense_v2, ttc_v2
 from utils.metrics import EpisodeStats
 from utils.observation import preprocess_obs, build_observation_space
 
@@ -47,6 +47,8 @@ class WebotsLaneEnv(gym.Env):
         # Per-episode step / stall counters (reset each reset()).
         self._step_count: int    = 0
         self._stall_counter: int = 0
+        # Previous cumulative distance, for the v2 distance-delta progress term.
+        self._prev_distance: float = 0.0
 
         # Obstacle config: optional `obstacles` section in config.yaml.
         # When omitted or {"enabled": False}, the obstacle subsystem is
@@ -93,6 +95,11 @@ class WebotsLaneEnv(gym.Env):
         self._episode_start_time = float(self._hw.driver.getTime())
         self._step_count         = 0
         self._stall_counter      = 0
+        # 0.0 right after a reset (forward-distance tracking was just zeroed).
+        # We track SIGNED forward displacement so reverses produce a negative
+        # distance_delta and v2's progress term penalises backward-driving
+        # reward hacking (Round 3 finding).
+        self._prev_distance      = self._hw.get_forward_distance()
 
         return self._get_obs(), {}
 
@@ -110,6 +117,16 @@ class WebotsLaneEnv(gym.Env):
 
         # Raw sensor read — used by reward and stats (physical units).
         raw_obs = self._get_raw_obs()
+
+        # Signed forward displacement this step — drives the v2 distance-based
+        # progress term. get_forward_distance() projects displacement onto the
+        # car's forward axis: positive when moving forward, negative when
+        # reversing. The v2 reward then pays nothing for reverse-driving escapes.
+        # (Path-length get_distance_travelled() is still tracked separately
+        # and reported in EpisodeStats / safety_score for visibility.)
+        current_distance    = self._hw.get_forward_distance()
+        distance_delta      = current_distance - self._prev_distance
+        self._prev_distance = current_distance
 
         # Step / stall bookkeeping.
         self._step_count += 1
@@ -134,7 +151,7 @@ class WebotsLaneEnv(gym.Env):
         else:
             termination_reason = ""
 
-        reward = self._compute_reward(raw_obs, terminated)
+        reward = self._compute_reward(raw_obs, terminated, distance_delta)
         self._update_episode_stats(raw_obs, terminated, truncated, reward)
         obs = preprocess_obs(raw_obs, self.config)
 
@@ -157,11 +174,12 @@ class WebotsLaneEnv(gym.Env):
         cam_h, cam_w = self.config["env"]["camera_resolution"]
         raw = self._hw.get_camera_image()
         img = cv2.resize(raw, (cam_w, cam_h))
+        theta_norm, line_visible = self._hw.get_alignment_angle()
         return {
             "camera": img,
             "lidar":  self._hw.get_lidar_scan(),
             "state":  np.array(
-                [self._hw.get_forward_speed(), self._hw.get_alignment_angle()],
+                [self._hw.get_forward_speed(), theta_norm, float(line_visible)],
                 dtype=np.float32,
             ),
         }
@@ -174,22 +192,28 @@ class WebotsLaneEnv(gym.Env):
         """Physics-based collision detection via touch sensor."""
         return self._hw.is_collision()
 
-    def _compute_reward(self, obs: dict, terminated: bool) -> float:
-        v     = float(obs["state"][0])   # speed
-        theta = float(obs["state"][1])   # alignment angle
-        # TODO: `d` is a proxy for the lateral distance to the yellow line —
-        # it is the normalised image offset |theta| ∈ [0, 1], NOT a metric
-        # cross-track error.
-        d   = abs(theta)
-        cfg = self._reward_cfg
-
+    def _compute_reward(self, obs: dict, terminated: bool, distance_delta: float) -> float:
+        state      = obs["state"]
+        v          = float(state[0])     # speed (m/s)
+        theta_norm = float(state[1])     # alignment proxy ∈ [-1, 1] (1.0 when lost)
+        line_lost  = float(state[2]) < 0.5
+        cfg        = self._reward_cfg
         reward_type = cfg.get("type", "dense")
 
-        if reward_type == "dense":
-            return dense_reward(v, theta, d, terminated, cfg)
+        lap_completed = self._hw.get_lap_completed()
+        d_min         = float(obs["lidar"].min())   # metres (raw scan)
+
+        if reward_type == "dense_v2":
+            return dense_v2(distance_delta, theta_norm, line_lost,
+                            lap_completed, terminated, cfg)
+        elif reward_type == "ttc_v2":
+            return ttc_v2(distance_delta, theta_norm, line_lost,
+                          lap_completed, terminated, d_min, cfg)
+        elif reward_type == "dense":
+            # Legacy: |alignment| stands in for cross-track error (NOT metres).
+            return dense_reward(v, theta_norm, abs(theta_norm), terminated, cfg)
         elif reward_type == "ttc":
-            d_min = float(obs["lidar"].min())
-            return ttc_reward(v, theta, d, d_min, terminated, cfg)
+            return ttc_reward(v, theta_norm, abs(theta_norm), d_min, terminated, cfg)
         elif reward_type == "sparse":
             return sparse_reward(checkpoint=False, collision=terminated)
         else:

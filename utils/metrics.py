@@ -34,6 +34,10 @@ def mean_lap_time(episodes: List[EpisodeStats]) -> float:
     return float(np.mean(all_laps)) if all_laps else float("nan")
 
 
+def mean_laps_per_episode(episodes: List[EpisodeStats]) -> float:
+    return float(np.mean([len(e.lap_times) for e in episodes]))
+
+
 def safety_score(episodes: List[EpisodeStats]) -> float:
     """Ratio of total distance to total near-misses (higher = safer)."""
     total_dist = sum(e.distance_travelled for e in episodes)
@@ -55,6 +59,7 @@ def summarise(episodes: List[EpisodeStats]) -> dict:
         "mean_collisions":      mean_collisions(episodes),
         "mean_cross_track_error_m": mean_cross_track_error(episodes),
         "mean_lap_time_s":      mean_lap_time(episodes),
+        "mean_laps_per_episode": mean_laps_per_episode(episodes),
         "safety_score":         safety_score(episodes),
         "mean_steps":           mean_steps(episodes),
         "mean_reward":          mean_reward(episodes),

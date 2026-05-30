@@ -615,12 +615,16 @@ BmwX5 {
   supervisor TRUE
   sensorsSlotFront [
     Lidar {
-      numberOfLayers 1
+      numberOfLayers 8
+      maxRange 30
+      fieldOfView 2.0
+      verticalFieldOfView 0.4
     }
   ]
   sensorsSlotTop [
     Camera {
       translation 0.72 0 -0.05
+      rotation 0 1 0 -0.4
       children [
         Pose {
           translation -0.05 0 0
@@ -640,7 +644,9 @@ BmwX5 {
           ]
         }
       ]
-      fieldOfView 1
+      fieldOfView 2.0
+      width 84
+      height 84
     }
   ]
   sensorsSlotCenter [

@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import cv2
@@ -7,8 +7,6 @@ from vehicle import Driver
 TIME_STEP       = 10      # ms — matches basicTimeStep in city.wbt
 MAX_STEER       = 0.5     # radians — max steering angle
 MAX_SPEED       = 50      # km/h — Driver.setCruisingSpeed takes km/h
-
-LIDAR_OUT_SIZE = 512
 
 # Yellow line HSV bounds — tune against your world's colour
 YELLOW_LO = np.array([18,  80,  80], dtype=np.uint8)
@@ -74,7 +72,12 @@ class WebotsEnv:
         # ── LiDAR ─────────────────────────────────────────────────
         self.lidar = self.driver.getDevice("lidar")
         self.lidar.enable(TIME_STEP)
-        self.lidar_size = LIDAR_OUT_SIZE
+        # getRangeImage() returns numberOfLayers * horizontalResolution floats
+        # (layers concatenated). Sizing off the device keeps the whole scan when
+        # numberOfLayers > 1 instead of collapsing it to a fixed length.
+        self.lidar_size = (
+            self.lidar.getNumberOfLayers() * self.lidar.getHorizontalResolution()
+        )
 
         # ── Steering motors ───────────────────────────────────────
         self.left_steer  = self.driver.getDevice("left_steer")
@@ -104,7 +107,8 @@ class WebotsEnv:
         self._lap_return_distance       = float(lap_return_distance)
 
         # ── Episode tracking state (populated by _reset_tracking) ─
-        self._distance_travelled: float     = 0.0
+        self._distance_travelled: float     = 0.0   # path-length (unsigned, m)
+        self._forward_distance: float       = 0.0   # signed projection on forward axis (m)
         self._last_translation: List[float] = list(self._init_translation)
         self._has_departed: bool            = False
         self._lap_start_time: float         = 0.0
@@ -170,6 +174,7 @@ class WebotsEnv:
     def _reset_tracking(self):
         """Clear all episode-level tracking state."""
         self._distance_travelled       = 0.0
+        self._forward_distance         = 0.0
         self._last_translation         = list(self._init_translation)
         self._has_departed             = False
         self._lap_start_time           = float(self.driver.getTime())
@@ -183,11 +188,26 @@ class WebotsEnv:
         now     = float(self.driver.getTime())
         current = self.driver_node.getField("translation").getSFVec3f()
 
-        # Path-length integration for total distance travelled.
+        # Per-step world-frame displacement.
         dx = current[0] - self._last_translation[0]
         dy = current[1] - self._last_translation[1]
         dz = current[2] - self._last_translation[2]
+
+        # Path-length integration for total distance travelled (unsigned, m).
+        # Kept for EpisodeStats / lap detection (which already uses euclidean
+        # distance-from-spawn separately, not this value).
         self._distance_travelled += float(np.sqrt(dx * dx + dy * dy + dz * dz))
+
+        # Signed forward-axis displacement (m). Reverses are NEGATIVE so the
+        # v2 reward, which consumes this via distance_delta, no longer pays
+        # the agent for driving backwards. Same forward axis convention as
+        # get_forward_speed(): -rot[:, 2] in world frame.
+        rot = np.array(self.driver_node.getOrientation()).reshape(3, 3)
+        forward_world = -rot[:, 2]
+        self._forward_distance += float(
+            dx * forward_world[0] + dy * forward_world[1] + dz * forward_world[2]
+        )
+
         self._last_translation = list(current)
 
         # Lap detection: arm after the car is far enough from spawn, then
@@ -234,8 +254,19 @@ class WebotsEnv:
         return self._laps_completed
 
     def get_distance_travelled(self) -> float:
-        """Cumulative path length (m) since the last reset."""
+        """Cumulative path length (m) since the last reset. Always ≥ 0."""
         return self._distance_travelled
+
+    def get_forward_distance(self) -> float:
+        """Cumulative SIGNED displacement projected onto the car's forward axis (m).
+
+        Positive when the car has net forward progress, negative when the car
+        has net reversed. Used by dense_v2/ttc_v2 to penalise the backward-
+        driving reward hacking observed in Round 3 (agent reversing through
+        intersection gaps to escape without colliding, since path-length
+        distance_travelled was unsigned and counted reversals as progress).
+        """
+        return self._forward_distance
 
     def is_near_miss(self) -> bool:
         """True iff the most recent step registered a near-miss."""
@@ -449,17 +480,39 @@ class WebotsEnv:
     # ── Sensor reads ──────────────────────────────────────────────
 
     def get_camera_image(self) -> np.ndarray:
-        """(H, W, 3) uint8 RGB array."""
+        """(H, W, 3) uint8 RGB array.
+
+        NOTE: Webots' Camera.getImage() returns raw bytes in BGRA order.
+        Prior to this fix the function dropped alpha and returned BGR,
+        but the docstring (and all downstream callers) assumed RGB. The
+        most damaging consequence was in get_alignment_angle(), which
+        used cv2.COLOR_RGB2HSV on BGR data: the yellow lane line
+        (RGB 217,191,76 / BGR 76,191,217) was interpreted as cyan, so
+        the HSV filter [18..35] never matched and the lane was reported
+        as not visible in every frame of every run in Rounds 1 and 2
+        (cross-track-error stuck at 1.0). We now convert BGR→RGB at the
+        source so every caller sees true RGB.
+        """
         raw = self.camera.getImage()
         img = np.frombuffer(raw, dtype=np.uint8).reshape((self.cam_h, self.cam_w, 4))
-        return img[:, :, :3].copy()
+        bgr = img[:, :, :3]
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     def get_lidar_scan(self) -> np.ndarray:
+        """Full range image, shape (lidar_size,) = numLayers * horizontalRes.
+
+        With numberOfLayers > 1 the layers are concatenated (layer 0 first). We
+        no longer sub-sample to a fixed 512: keeping every beam preserves the
+        per-layer structure the multi-layer configs exist to exploit.
+        """
         scan = np.array(self.lidar.getRangeImage(), dtype=np.float32)
-        scan = np.clip(np.nan_to_num(scan, nan=10.0, posinf=10.0), 0.0, 10.0)
-        scan[scan < 0.32] = 10.0  # body noise peaks at 0.265, filter up to 0.32
-        indices = np.linspace(0, len(scan) - 1, LIDAR_OUT_SIZE, dtype=int)
-        return scan[indices]
+        # Clip + body-noise sentinel use 30 m (was 10 m) to align with the
+        # Round 3 MAX/noTilt LiDAR maxRange=30. For bugFixOnly the physical
+        # maxRange is 1 m so the clip is a no-op, and normalize_lidar() final
+        # np.clip(0, 1) keeps the body-noise sentinel saturated at "far".
+        scan = np.clip(np.nan_to_num(scan, nan=30.0, posinf=30.0), 0.0, 30.0)
+        scan[scan < 0.32] = 30.0  # body noise peaks at 0.265, filter up to 0.32
+        return scan
 
     def is_collision(self) -> bool:
         """Returns list of contact points on this node."""
@@ -476,13 +529,23 @@ class WebotsEnv:
         forward_axis = rot[:, 2]
         return float(np.dot(v, -forward_axis))
 
-    def get_alignment_angle(self) -> float:
+    def get_alignment_angle(self) -> Tuple[float, bool]:
         """
-        Normalised lateral offset of the yellow centre line ∈ [-1, 1].
-        Negative → line is to the left of centre.
-        Returns 1.0 when the line is not visible.
+        Normalised lateral offset of the yellow centre line and a visibility flag.
 
-        NOTE: This is an image-plane proxy for cross-track error —
+        Returns
+        -------
+        theta_norm : float
+            Lateral offset ∈ [-1, 1] when the line is visible (negative → line
+            to the left of centre). When the line is NOT visible this is 1.0 —
+            kept (rather than 0.0) so the legacy ``state[1]`` semantics and the
+            cross-track-error metric, which both treat a lost line as maximal
+            offset, are unchanged. Callers that care about a lost line should
+            branch on ``line_visible`` rather than inspecting this value.
+        line_visible : bool
+            True iff any yellow pixels were detected in the camera frame.
+
+        NOTE: theta_norm is an image-plane proxy for cross-track error —
         a unitless fraction of half-image width, NOT metres.
         """
         img  = self.get_camera_image()
@@ -491,11 +554,11 @@ class WebotsEnv:
         cols = np.where(mask.any(axis=0))[0]
 
         if len(cols) == 0:
-            return 1.0
+            return 1.0, False
 
         cx     = float(cols.mean())
         centre = self.cam_w / 2.0
-        return (cx - centre) / centre
+        return (cx - centre) / centre, True
 
     def get_min_lidar_distance(self) -> float:
         return float(self.get_lidar_scan().min())

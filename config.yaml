@@ -1,5 +1,5 @@
 env:
-  camera_resolution: [32, 32]      # H x W — must match E-puck camera in Webots
+  camera_resolution: [84, 84]      # H x W — matches the 84x84 Camera in the MAX/noTilt smoke .wbt worlds
 
 action_space:
   type: continuous                  # overridden by --agent flag in train.py
@@ -14,21 +14,32 @@ observation:
   # If false, ranges pass through as float32 metres and the obs-space upper
   # bound becomes lidar_max_range instead of 1.0.
   normalize_lidar: true
-  # Upper bound (m) of LiDAR ranges — must match the clip applied by
-  # WebotsEnv.get_lidar_scan() (currently 10 m).
-  lidar_max_range: 10.0
+  # Upper bound (m) used to normalise LiDAR ranges. Set to 30 to align with the
+  # maxRange of the MAX/noTilt smoke .wbt LiDARs. KNOWN MISMATCH: get_lidar_scan()
+  # still clips raw ranges to 10 m (the body-noise sentinel), so with this at 30
+  # the normalised scan only spans [0, 1/3]. Re-tuning that clip to maxRange is
+  # tracked as Round-3 future work; left as-is here to isolate the camera bug fix.
+  lidar_max_range: 30.0
 
 reward:
   type: dense                       # overridden by --reward flag in train.py
-  # dense / ttc shared weights
+  # ── v1 weights (legacy: dense / ttc) ──
   w1: 1.0                           # progress weight
   w2: 0.5                           # alignment / deviation penalty weight
   w3: 1.0                           # collision / safety weight
   # ttc-only
   w4: 10.0                          # terminal penalty weight
   d_safe: 1.0                       # safety radius (metres)
-  # collision detection threshold
+  # collision detection threshold (shared)
   collision_threshold: 0.35          # metres — LiDAR below this → terminated
+  # ── v2 weights (dense_v2 / ttc_v2) ──
+  w_progress: 1.0                   # multiplier on distance-delta progress (m/step)
+  w_lap: 50.0                       # one-off bonus when a lap closes
+  w_collision: 100.0                # collision penalty magnitude (applied negated)
+  w_line_lost: 0.3                  # per-step penalty while the yellow line is lost (lowered from 1.0 to avoid reward-hack: at 14 m/s progress max ≈ 0.14/step, so 1.0/step made line-lost dominate)
+  # ttc_v2 only
+  w_safety: 2.0                     # proximity-penalty weight
+  d_safe_v2: 0.5                    # m — safety fires only inside this radius (½ of v1 d_safe)
 
 agent:
   learning_rate: 3.0e-4
@@ -38,7 +49,7 @@ agent:
 
 training:
   total_timesteps: 50000            # reduce for a quick smoke test
-  checkpoint_every_n_steps: 200000  # Save a checkpoint every N timesteps (0 disables)
+  checkpoint_every_n_steps: 100000  # Save a checkpoint every N timesteps (0 disables)
 
 episode:
   max_steps: 100000            # Truncate episode after this many steps (0 disables) — 100s at 10ms/step
