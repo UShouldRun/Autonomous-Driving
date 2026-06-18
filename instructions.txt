@@ -1,0 +1,262 @@
+=====================================================================
+  DQN vs. PPO: Action Space Constraints in Autonomous Driving
+  Group A
+  - Joao Ferreira     (up202306717)
+  - Henrique Teixeira (up202306640)
+  - Miguel Almeida    (up202303926)
+=====================================================================
+
+
+1. SUPPORTED OPERATING SYSTEMS
+------------------------------------------------------------
+
+The project has been developed and tested on:
+
+  - Windows 10 (64-bit)
+  - Ubuntu 20.04.6 LTS (Focal Fossa)
+
+It is NOT supported on macOS or other operating systems.
+
+
+2. SOFTWARE PREREQUISITES
+------------------------------------------------------------
+
+The following must be installed before running the code:
+
+  (a) Webots R2025a or newer
+      Download: https://cyberbotics.com/
+      The Webots installation provides the C/Python "controller"
+      library that is required to communicate with the simulator.
+
+  (b) Python 3.10 (recommended) or any 3.10+ version
+      Other Python versions may work but were not tested.
+
+  (c) Git (only required if cloning from the repository)
+
+
+3. PYTHON DEPENDENCIES
+------------------------------------------------------------
+
+All required Python modules are listed in "requirements.txt"
+at the root of the project. They are:
+
+  - gymnasium>=0.29.0
+  - stable-baselines3>=2.3.0
+  - torch>=2.2.0
+  - numpy>=1.26.0
+  - opencv-python>=4.9.0
+  - pyyaml>=6.0
+  - matplotlib>=3.8.0
+  - pandas>=2.2.0
+
+We recommend creating an isolated virtual environment (conda or
+venv) and installing the dependencies into it:
+
+  # Option A - conda
+  conda create -n webots python=3.10
+  conda activate webots
+  pip install -r requirements.txt
+
+  # Option B - venv (Linux / macOS)
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install -r requirements.txt
+
+  # Option B - venv (Windows PowerShell)
+  python -m venv .venv
+  .\.venv\Scripts\Activate.ps1
+  pip install -r requirements.txt
+
+
+4. ENVIRONMENT VARIABLES (REQUIRED EVERY SESSION)
+------------------------------------------------------------
+
+The training and evaluation scripts run as EXTERNAL Webots
+controllers. They need to import the Webots Python "controller"
+module that ships with the Webots installation.
+
+  Linux (Ubuntu 20.04):
+
+    export WEBOTS_HOME=/usr/local/webots
+    export PYTHONPATH=$WEBOTS_HOME/lib/controller/python:$PWD
+
+  Windows (PowerShell):
+
+    $env:WEBOTS_HOME = "C:\Program Files\Webots"
+    $env:PYTHONPATH  = "$env:WEBOTS_HOME\lib\controller\python;$pwd"
+
+Replace the WEBOTS_HOME path if Webots was installed elsewhere.
+
+Setting PYTHONPATH to include "$pwd" (the project root) is what
+allows the scripts under "exps/" to find the "env/" and "utils/"
+Python packages.
+
+
+5. PROJECT LAYOUT
+------------------------------------------------------------
+
+  config.yaml              Base training configuration (Track 1)
+  finetune.yaml            Fine-tuning configuration (Track 2)
+  obstacles.yaml           Obstacle-avoidance fine-tuning config
+
+  env/                     Gym wrapper, reward functions, Webots
+                           bridge, LaneCNN feature extractor
+  utils/                   Helpers (metrics, callbacks, observation
+                           normalisation)
+  exps/                    Entry-point scripts
+    train.py               Training (PPO and DQN)
+    eval.py                Evaluation of a trained model
+    hyper.py               Optuna hyper-parameter search
+
+  worlds/                  Webots .wbt world files (tracks)
+    city_level1_v2.wbt     Track 1 - simple loop
+    city_level2_v2.wbt     Track 2 - tighter curves
+    city_level3_v2.wbt     Track 3 - complex (zero-shot eval)
+    city_level1_obstacles.wbt  Track 1 with static barrels
+
+  results/                 Trained model checkpoints and CSV logs
+    best_ppo.zip                 Best PPO model (Tracks 1+2)
+    best_dqn.zip                 Best DQN model (Tracks 1+2)
+    best_ppo_obstacles.zip       PPO fine-tuned for obstacles
+
+  docs/                    The scientific paper (article.typ, .pdf)
+
+
+6. RUNNING THE CODE
+------------------------------------------------------------
+
+All commands below assume:
+  - You are in the project root directory.
+  - The Python environment from Section 3 is active.
+  - The environment variables from Section 4 are set.
+
+6.1. Open a world in Webots
+------------------------------
+Launch Webots and open one of the .wbt files in worlds/.
+For example, open "worlds/city_level1_v2.wbt" to load Track 1.
+Pause the simulation (it will start paused by default if the
+robot controller is set to "<extern>").
+
+6.2. Train a model from scratch
+-------------------------------
+
+  # PPO with dense reward on Track 1 (default config.yaml)
+  python exps/train.py --agent ppo --reward dense \
+                       --run-tag ppo_dense_track1
+
+  # DQN with dense reward on Track 1
+  python exps/train.py --agent dqn --reward dense \
+                       --run-tag dqn_dense_track1
+
+The training process writes per-episode metrics to
+"results/<run-tag>/metrics.csv" and saves the best model as
+"results/<run-tag>/best.zip".
+
+6.3. Fine-tune on Track 2
+-------------------------
+
+  python exps/train.py --agent ppo --reward dense \
+                       --config finetune.yaml \
+                       --resume results/best_ppo.zip \
+                       --run-tag ppo_finetune_track2
+
+Before running, switch the Webots world to "city_level2_v2.wbt".
+
+6.4. Fine-tune for obstacle avoidance
+-------------------------------------
+
+  python exps/train.py --agent ppo --reward dense \
+                       --config obstacles.yaml \
+                       --resume results/best_ppo.zip \
+                       --run-tag ppo_obstacles
+
+Before running, switch the Webots world to
+"city_level1_obstacles.wbt".
+
+6.5. Evaluate a trained model
+-----------------------------
+
+  # Evaluate the best PPO model over 10 episodes
+  python exps/eval.py --model results/best_ppo.zip --episodes 10
+
+  # Evaluate on the unseen Track 3 (open city_level3_v2.wbt first)
+  python exps/eval.py --model results/best_ppo.zip --episodes 10
+
+  # Evaluate the obstacle-avoidance model
+  # (open city_level1_obstacles.wbt first)
+  python exps/eval.py --model results/best_ppo_obstacles.zip \
+                      --episodes 10
+
+The evaluation script writes per-episode results to
+"results/eval_<model>_<N>ep.csv".
+
+
+7. REPRODUCING THE PAPER RESULTS
+------------------------------------------------------------
+
+The exact checkpoints used in the paper are included under
+results/:
+
+  best_ppo.zip            - PPO model trained on Tracks 1+2
+  best_dqn.zip            - DQN model trained on Tracks 1+2
+  best_ppo_obstacles.zip  - PPO model fine-tuned with obstacles
+
+To reproduce each row of Table 1 of the paper, open the
+corresponding world in Webots, set the simulation to <extern>
+controller mode, and run "exps/eval.py" with the matching model
+and 10 episodes:
+
+  Row PPO T1  -> world: city_level1_v2.wbt
+                 model: results/best_ppo.zip
+  Row PPO T2  -> world: city_level2_v2.wbt
+                 model: results/best_ppo.zip
+  Row PPO T3  -> world: city_level3_v2.wbt
+                 model: results/best_ppo.zip
+  Row DQN T1  -> world: city_level1_v2.wbt
+                 model: results/best_dqn.zip
+  Row DQN T2  -> world: city_level2_v2.wbt
+                 model: results/best_dqn.zip
+  Row DQN T3  -> world: city_level3_v2.wbt
+                 model: results/best_dqn.zip
+  Row PPO Obs -> world: city_level1_obstacles.wbt
+                 model: results/best_ppo_obstacles.zip
+
+The reference CSV outputs that produced the paper figures and
+table are also included under "results/" (files named
+"eval_best_*.csv").
+
+NOTE - for testing PPO with obstacles, clone the repo from GitHub with:
+
+git clone git@github.com:UShouldRun/Autonomous-Driving
+
+The model is in the file results/best_ppo_obstacles.zip.
+
+8. TROUBLESHOOTING
+------------------------------------------------------------
+
+  "ModuleNotFoundError: No module named 'controller'"
+    The Webots Python controller library is not on PYTHONPATH.
+    Re-check Section 4 (WEBOTS_HOME and PYTHONPATH).
+
+  "ModuleNotFoundError: No module named 'env'"
+    The project root is not on PYTHONPATH. Re-export PYTHONPATH
+    to include "$pwd" (Linux) or "$pwd" (PowerShell), as shown
+    in Section 4.
+
+  "size mismatch for mlp_extractor..." when loading a checkpoint
+    The current config does not match the architecture the
+    checkpoint was trained with. Verify that "config.yaml" has
+    camera_resolution: [128, 128] and cnn_features_dim: 512.
+
+  The training does not start / Webots is unresponsive
+    Make sure the Webots simulation is in "paused" state and the
+    BMW X5 robot has controller "<extern>" in the .wbt file.
+    The Python script connects to the simulator when launched.
+
+  Out-of-memory while training
+    Lower the batch_size and n_steps fields in config.yaml.
+
+
+=====================================================================
+  End of instructions.
+=====================================================================

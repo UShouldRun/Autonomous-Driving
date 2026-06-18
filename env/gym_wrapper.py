@@ -153,7 +153,7 @@ class WebotsLaneEnv(gym.Env):
             termination_reason = ""
 
         reward = self._compute_reward(
-            raw_obs, terminated, line_lost, distance_delta,
+            raw_obs, terminated, distance_delta,
             theta, self._prev_theta
         )
 
@@ -193,7 +193,7 @@ class WebotsLaneEnv(gym.Env):
     def _yellow_line_is_not_visible(self, yellow_score: float) -> bool:
         return yellow_score < 0.5
     
-    def _compute_reward(self, obs: dict, terminated: bool, line_lost: bool, distance_delta: float, theta: float,
+    def _compute_reward(self, obs: dict, terminated: bool, distance_delta: float, theta: float,
                         prev_theta: float = None) -> float:
         state         = obs["state"]
         v             = float(state[0])
@@ -203,7 +203,7 @@ class WebotsLaneEnv(gym.Env):
         lap_completed = self._hw.get_lap_completed()
 
         if reward_type == "dense":
-            return dense_reward(v, theta, line_lost,
+            return dense_reward(v, theta,
                             lap_completed, terminated, cfg,
                             distance_delta=distance_delta,
                             near_miss=self._hw.is_near_miss(),

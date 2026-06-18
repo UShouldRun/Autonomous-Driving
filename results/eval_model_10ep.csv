@@ -1,0 +1,3 @@
+episode,collisions,lap_completed,lap_time_s,mean_cte,total_distance_m,near_misses,total_steps,total_reward,termination_reason
+1,1,False,nan,0.3441518708975323,323.59491640228055,0,2371,30133.454309090805,yellow line not visible
+2,1,False,nan,0.3149858248530032,321.8004802132822,0,2497,31137.06334593934,yellow line not visible

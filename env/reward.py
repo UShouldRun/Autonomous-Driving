@@ -12,9 +12,8 @@ MAX_SPEED_MS = 50.0 / 3.6   # ≈ 13.89 m/s
 def dense_reward(
     forward_speed: float,
     theta: float,
-    line_lost: bool,
     lap_completed: bool,
-    collision: bool,
+    terminated: bool,
     cfg: dict,
     distance_delta: float = 0.0,
     near_miss: bool = False,
@@ -36,16 +35,13 @@ def dense_reward(
     w_alignment_penalty = float(cfg.get("w_alignment_penalty", 3.0))
     w_alignment_bonus   = float(cfg.get("w_alignment_bonus", 3.0))
     w_alignment_improve = float(cfg.get("w_alignment_improve", 3.0))
-    w_line_lost         = float(cfg.get("w_line_lost", 20.0))
-    w_collision         = float(cfg.get("w_collision", 100.0))
+    w_terminated        = float(cfg.get("w_terminated", 100.0))
     w_lap               = float(cfg.get("w_lap", 50.0))
     w_existence         = float(cfg.get("w_existence", 0.01))
     w_near_miss         = float(cfg.get("w_near_miss", 5.0))
 
-    if collision:
-        return float(-w_collision)
-    if line_lost:
-        return float(-w_line_lost)
+    if terminated:
+        return float(-w_terminated)
 
     if prev_theta is not None:
         theta_improvement = np.clip(abs(prev_theta) - abs(theta), 0.0, 1.0)

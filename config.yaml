@@ -23,10 +23,9 @@ reward:
   w_alignment_bonus: 4.0
   w_alignment_improve: 4.0
 
-  w_line_lost: 20.0
   w_existence: 0.01
   w_lap: 50.0
-  w_collision: 100.0
+  w_terminated: 100.0
   w_near_miss: 5.0
 
   collision_threshold: 0.35
